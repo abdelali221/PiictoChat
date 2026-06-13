@@ -35,19 +35,41 @@
 
 #include "wd.h"
 
-#define VER "0.1a"
+#define VER "0.2a"
 
-static volatile bool refresh_beacon = false;
-static volatile bool beaconActive = false;
-static volatile bool recv_frame_active = false;
+static volatile bool refresh_beacon = true;
+static volatile bool refresh_beacon_once = false;
+static volatile bool beaconActive = true;
+static volatile bool recv_frame_active = true;
+static volatile bool mp_inf_active = true;
+static volatile bool mp_send_active = true;
 
 #define STACKSIZE 0x8000
 
 static uint8_t beacon_stack[STACKSIZE];
 static uint8_t recv_frame_stack[STACKSIZE];
+static uint8_t mp_inf_stack[STACKSIZE];
+static uint8_t mp_send_stack[STACKSIZE];
 
 static lwp_t beacon_thread_ptr;
 static lwp_t recv_frame_thread_ptr;
+static lwp_t mp_inf_thread_ptr;
+static lwp_t mp_send_thread_ptr;
+
+typedef struct Client_inf
+{
+	uint8_t current_state;
+	bool is_connected;
+	uint8_t namestate;
+	char name[0xA];
+} Client_inf;
+
+Client_inf client_list[0x10];
+
+enum {
+	WD_STATE_DSWAIT = 0,
+	WD_STATE_GETNAME,
+};
 
 static void hexdump(const void *_src, u32 length)
 {
@@ -65,17 +87,16 @@ static void hexdump(const void *_src, u32 length)
 	if (i & 15)
 		printf("\n");
 }
-/*
+
 void wdDoSend(uint8_t *send_buf, u32 in_len, uint8_t* conf)
 {
 
 	uint16_t cTime = (uint16_t)(ticks_to_microsecs(gettick())/64);
 	s32 ret = WD_ChangeVTSF(cTime);
 	if(ret < 0)	printf("WD_ChangeVTSF=0x%x\n", ret);
-	ret = WD_MpSendFrame(send_buf, in_len, send_buf + 0x200, 0x10);
+	ret = WD_MpSendFrame(send_buf, in_len, conf, 0x10);
 	if(ret) printf("SendFrame Err 0x%x\n", ret);
 }
-*/
 
 typedef struct PictoChat_beacon {
 	uint32_t header;
@@ -94,13 +115,11 @@ PictoChat_beacon *pictochat_beacon;
 
 static void* beacon_thread(void * nul)
 {
-
 	uint16_t beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
 	printf("\nBeacon thread startup\n");
 	printf("\nStarting beacon");
-	uint8_t beacon_data[0x30];
-	memcpy(beacon_data, pictochat_beacon, 0x18);
-	int ret = WD_ChangeBeacon(beaconIn, beacon_data, 0x20);
+
+	int ret = WD_ChangeBeacon(beaconIn, (uint8_t*)pictochat_beacon, 0x20);
 	if(ret < 0)	printf("WD_StartBeacon=0x%x\n", ret);
 	putchar('.');
 	ret = WD_SetLinkState(1);
@@ -117,10 +136,17 @@ static void* beacon_thread(void * nul)
 	{
 		if(refresh_beacon)
 		{
-			//beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
-			//WD_ChangeBeacon(beaconIn, beacon_data, 0x20);
-			//uint8_t *dat = wdGameInfo;
-			//wdDoSend(dat, 0x10, wdSendBufconf);
+			beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
+			WD_ChangeBeacon(beaconIn, (uint8_t*)pictochat_beacon, 0x20);
+		} else if (refresh_beacon_once) {
+			if(pictochat_beacon->users_connected > 1) {
+				pictochat_beacon->status = 0x8ABD;
+			} else {
+				pictochat_beacon->status = 0x4823;
+			}
+			beaconIn = (uint16_t)(ticks_to_microsecs(gettick())/64);
+			WD_ChangeBeacon(beaconIn, (uint8_t*)pictochat_beacon, 0x20);
+			refresh_beacon_once = false;
 		}
 		usleep(200*1000);
 	}
@@ -143,15 +169,115 @@ static void* recv_frame_thread(void * nul)
 	printf("\nReceive thread startup");
 	while(recv_frame_active)
 	{
-		//s32 ret = WD_ReceiveFrame(wdRecvFrame, 0x2000);
-		WD_RecvNotification(wdRecvFrame, 0x2000);
-		printf("\x1b[2J");
-		hexdump(wdRecvFrame, 0x20);
+		s32 ret = WD_ReceiveFrame(wdRecvFrame, 0x2000);
+		//printf("\x1b[2J");
+		//hexdump(wdRecvFrame, 0x20);
+		if(ret > 0xA && wdRecvFrame[0xB] > 0 && wdRecvFrame[0x12] == 4)
+		{
+			uint8_t port = (wdRecvFrame[0x13]&0xF);
+			uint8_t reply = wdRecvFrame[0x14];
+			uint8_t seq = wdRecvFrame[0x15];
+			/*
+			if(client_list[port].current_state == WD_STATE_GETNAME && reply == 7 && seq < 5)
+			{
+				client_list[port].namestate |= 1<<seq;
+				if(seq)
+				{
+					uint8_t off = (seq-1)*3;
+					client_list[port].name[off] = wdRecvFrame[0x16];
+					if(seq < 4)
+					{
+						client_list[port].name[off+1] = wdRecvFrame[0x18];
+						client_list[port].name[off+2] = wdRecvFrame[0x1A];
+					}
+				}
+				if(client_list[port].namestate == 0x1F) {
+					client_list[port].current_state = WD_STATE_DSWAIT;
+					printf("\nDS Name : %s", client_list[port].name);
+				}
+			}
+			*/
+		}
 		memset((void*)wdRecvFrame, 0, 0x20);
 	}
 	printf("\nReceive thread shutdown");
 	return nul;
 }
+
+uint8_t idle_msg[3] = {
+	0x00, 0x00, 0x00,
+};
+
+uint8_t wdSendBuf[0x210];
+
+static void* mp_send_thread(void * nul)
+{
+	//some raw WD config
+	uint8_t conf[0x10];
+	memset(conf,0,0x10);
+	conf[0x7] = 0xC; //A and C works, C used by official games
+	while(mp_send_active)
+	{
+		for(int i = 0; i < 3; i++) {
+			if(client_list[i].is_connected) {
+				conf[0x9] = ((i + 1)<<1);
+				switch(client_list[i].current_state)
+				{
+					default:
+						memcpy(wdSendBuf, idle_msg, sizeof(idle_msg));
+						wdDoSend(wdSendBuf, 4, conf);
+						usleep(1200);
+					break;
+				}
+			}
+		}
+	}
+	//some raw WD config
+	conf[0x9] = 0; //send to ourself
+
+	//Force wake up Receive Thread by sending something
+	wdDoSend(idle_msg, sizeof(idle_msg), conf);
+
+	return nul;
+}
+
+static void* mp_inf_thread(void * nul)
+{
+	uint8_t wdReq[0x94];
+	while(mp_inf_active)
+	{
+		memset(wdReq, 0, 0x94);
+		s32 ret = WD_RecvNotification(wdReq, 0x94);
+		if(ret != 0)
+			printf("\rWD_RecvNotification Err 0x%x", ret);
+		else
+		{
+			int32_t ret = 0;
+			memcpy(&ret, wdReq, 4);
+			int16_t chan = 0;
+			memcpy(&chan, wdReq+0xE, 2);
+			if(ret == 0 && chan)
+			{
+				client_list[chan - 1].is_connected = true;
+				client_list[chan - 1].current_state = WD_STATE_GETNAME;
+				if(pictochat_beacon->users_connected < 16) pictochat_beacon->users_connected++;
+				printf("\nDS On Channel %d connected\nUsers connected : %d\n", chan, pictochat_beacon->users_connected);
+				refresh_beacon_once = true;
+			}
+			else if(ret == 1 && chan)
+			{
+				printf("\nDS On Channel %d disconnected\n", chan);
+				client_list[chan - 1].is_connected = false;
+				if(pictochat_beacon->users_connected > 1) pictochat_beacon->users_connected--;
+				refresh_beacon_once = true;
+			}
+			//else if(ret != 3)
+				//printf("\nDS Ret %d Chan %d\n", ret, chan);
+		}
+	}
+	return nul;
+}
+
 /*
 uint16_t UTF8toUTF16(char chr) 
 {
@@ -267,6 +393,7 @@ void ParseScanBuff(u8* ScanBuff, u16 ScanBuffSize)
     }
 }
 */
+
 int main() 
 {
 	void *xfb = NULL;
@@ -281,11 +408,13 @@ int main()
 	VIDEO_WaitVSync();
 	if(rmode->viTVMode&VI_NON_INTERLACE)
 		VIDEO_WaitVSync();
-	//console_init(xfb,24,32,rmode->fbWidth-32,rmode->xfbHeight-48,rmode->fbWidth*VI_DISPLAY_PIX_SZ);
+
 	CON_InitEx(rmode, 24, 32, rmode->fbWidth-32, rmode->xfbHeight-48);
 	VIDEO_ClearFrameBuffer(rmode, xfb, COLOR_BLACK);
 
 	WPAD_Init();
+
+	memset(client_list, 0, sizeof(Client_inf) * 0x10);
 
 	printf("\nPiict%cChat v%s\nCreated by Abdelali221\n", 1, VER);
 	
@@ -328,21 +457,6 @@ int main()
 		} else if(wdown & WPAD_BUTTON_LEFT) {
 			room = (room - 1) & 3;
 			printf("\rPlease select desired room : <%c>", 'A' + room);
-		} else if(wdown & WPAD_BUTTON_A)
-			break;		
-	}
-
-	uint8_t n_players = 0;
-	printf("\rPlease select how many players : <01>");
-	while(1) {
-		WPAD_ScanPads();
-		uint32_t wdown = WPAD_ButtonsDown(0);
-		if(wdown & WPAD_BUTTON_RIGHT) {
-			n_players = (n_players + 1) & 0xF;
-			printf("\rPlease select how many players : <%02d>", n_players + 1);
-		} else if(wdown & WPAD_BUTTON_LEFT) {
-			n_players = (n_players - 1) & 0xF;
-			printf("\rPlease select how many players : <%02d>", n_players + 1);
 		} else if(wdown & WPAD_BUTTON_A)
 			break;		
 	}
@@ -390,7 +504,7 @@ int main()
 	beacon_dat.unk0 = 0x0801;
 	beacon_dat.status = 0x4823;
 	beacon_dat.current_room = room;
-	beacon_dat.users_connected = n_players + 1;
+	beacon_dat.users_connected = 1;
 	beacon_dat.unk1 = 0x0400;
 
 	uint16_t rval = gettick();
@@ -398,13 +512,16 @@ int main()
 
 	pictochat_beacon = &beacon_dat;
 
-	printf("\nPress A to start beacon...");
+	//printf("\nPress A to start beacon...");
 	
 	//mpdl_active = true;
 	//Beacon Thread
-	//LWP_CreateThread(&beacon_thread_ptr,beacon_thread,NULL,beacon_stack,STACKSIZE,0x40);
-	//LWP_CreateThread(&recv_frame_thread_ptr,recv_frame_thread,NULL,recv_frame_stack,STACKSIZE,0x40);
-
+	LWP_CreateThread(&beacon_thread_ptr,beacon_thread,NULL,beacon_stack,STACKSIZE,0x40);
+	sleep(1);
+	LWP_CreateThread(&mp_inf_thread_ptr,mp_inf_thread,NULL,mp_inf_stack,STACKSIZE,0x40);
+	LWP_CreateThread(&recv_frame_thread_ptr,recv_frame_thread,NULL,recv_frame_stack,STACKSIZE,0x80);
+	LWP_CreateThread(&mp_send_thread_ptr,mp_send_thread,NULL,mp_send_stack,STACKSIZE,0x80);
+	
 	while(1)
 	{
 		WPAD_ScanPads();
@@ -424,20 +541,42 @@ int main()
 			LWP_CreateThread(&recv_frame_thread_ptr,recv_frame_thread,NULL,recv_frame_stack,STACKSIZE,0x80);
 		}
 		if(wdown & WPAD_BUTTON_2 && recv_frame_active) {
-			recv_frame_active = false;
-			LWP_JoinThread(recv_frame_thread_ptr, NULL);
+			
+		}
+		if(wdown & WPAD_BUTTON_UP) {
+			pictochat_beacon->users_connected++;
+			refresh_beacon_once = true;
+		}
+		if(wdown & WPAD_BUTTON_DOWN) {
+			pictochat_beacon->users_connected--;
+			refresh_beacon_once = true;
 		}
 		VIDEO_WaitVSync();
+	}
+	/*
+	if(recv_frame_active) {
+		recv_frame_active = false;
+		
+	}
+	
+	*/
+	if(mp_send_active) {
+		mp_send_active = false;
+		LWP_JoinThread(mp_send_thread_ptr, NULL);
 	}
 	if(recv_frame_active) {
 		recv_frame_active = false;
 		LWP_JoinThread(recv_frame_thread_ptr, NULL);
 	}
+	if(mp_inf_active) {
+		mp_inf_active = false;
+		LWP_JoinThread(mp_inf_thread_ptr, NULL);
+	}
 	if(beaconActive) {
 		beaconActive = false;
 		LWP_JoinThread(beacon_thread_ptr, NULL);
 	}
-	
+		
 	//WD_Cleanup
 	WD_Deinit();
 
