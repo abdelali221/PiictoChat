@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+	<name>PiictoChat</name>
+	<version>v0.1a</version>
+	<release_date>20260612000000</release_date>
+	<coder>Abdelali221</coder>
+	<short_description>PictoChat Client</short_description>
+	<long_description>Use your Wii as a PictoChat client!
+</long_description>
+</app>
