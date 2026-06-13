@@ -528,6 +528,7 @@ int main()
 		uint32_t wdown = WPAD_ButtonsDown(0);
 		if(wdown & WPAD_BUTTON_HOME)
 			break;
+		/*
 		if(wdown & WPAD_BUTTON_A && !beaconActive) {
 			beaconActive = true;
 			LWP_CreateThread(&beacon_thread_ptr,beacon_thread,NULL,beacon_stack,STACKSIZE,0x40);
@@ -551,6 +552,7 @@ int main()
 			pictochat_beacon->users_connected--;
 			refresh_beacon_once = true;
 		}
+		*/
 		VIDEO_WaitVSync();
 	}
 	/*
